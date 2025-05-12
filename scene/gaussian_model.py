@@ -48,6 +48,13 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree, optimizer_type="default"):
+
+        ##############Emma's Additions####################
+        self._deformation = None  # Will be set in training or loading
+        
+
+        ###########Emma's Additions End###################
+
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
