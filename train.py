@@ -22,6 +22,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+from transformers import AutoImageProcessor, DINOv2Model
+import torch.nn.functional as F
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -41,6 +46,25 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    #############Emma's addition###############
+    # Load DINOv2 model for feature extraction
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    dinov2 = DINOv2Model.from_pretrained("facebook/dinov2-base").cuda()
+    dinov2.eval()
+
+    def extract_dino_features(img_tensor):
+        """Expects img_tensor: [1, 3, H, W] in [0,1]"""
+        inputs = processor(images=img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy(), return_tensors="pt")['pixel_values'].cuda()
+        with torch.no_grad():
+            outputs = dinov2(inputs)
+        return outputs.last_hidden_state  # shape: [1, num_patches, 768]
+
+    def cosine_patch_loss(feats_A, feats_B):
+        A = F.normalize(feats_A, dim=-1)
+        B = F.normalize(feats_B, dim=-1)
+        return 1 - (A * B).sum(-1).mean()
+    
+##############Emma's addition end###############
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -56,6 +80,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    ####Emma's addition####
+
+     # Load and prepare style image and depth
+    from PIL import Image
+    import numpy as np
+
+    style_rgb = Image.open("path/to/your_style_image.jpg").convert("RGB").resize((512, 512))
+    style_depth = np.load("path/to/your_style_depth.npy")  # shape: [H, W]
+    style_depth_img = Image.fromarray((style_depth / style_depth.max() * 255).astype(np.uint8)).convert("RGB").resize((512, 512))
+
+    # Extract style features
+    style_rgb_tensor = processor(images=style_rgb, return_tensors="pt")['pixel_values'].cuda()
+    style_depth_tensor = processor(images=style_depth_img, return_tensors="pt")['pixel_values'].cuda()
+
+    with torch.no_grad():
+        style_rgb_feats = dinov2(style_rgb_tensor).last_hidden_state  # [1, N, 768]
+        style_depth_feats = dinov2(style_depth_tensor).last_hidden_state  # [1, N, 768]
+
+    ####Emma's addition end####
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -110,6 +154,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+
+        #####Emma's addition#####
+
+         # ----- Extract DINOv2 features from RGB and Depth -----
+        render_rgb = image.unsqueeze(0)  # [1, 3, H, W]
+        render_depth = render_pkg["depth"].repeat(3, 1, 1).unsqueeze(0)  # [1, 3, H, W]
+
+        # Normalize depth
+        render_depth = (render_depth - render_depth.min()) / (render_depth.max() - render_depth.min() + 1e-5)
+
+        # Extract features
+        rgb_feats = extract_dino_features(render_rgb)
+        depth_feats = extract_dino_features(render_depth)
+
+        # Compute style loss
+        style_loss_rgb = cosine_patch_loss(rgb_feats, style_rgb_feats)
+        style_loss_depth = cosine_patch_loss(depth_feats, style_depth_feats)
+
+        style_loss = 1.0 * style_loss_rgb + 1.0 * style_loss_depth  # tune weights as needed
+        loss += style_loss
+
+
+        #####Emma's addition end#####
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -211,6 +279,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+
+         
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
