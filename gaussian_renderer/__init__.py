@@ -51,7 +51,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    ############Emma's additions############
+    # means3D = pc.get_xyz
+    means3D = pc.get_deformed_xyz # This is the 3D means of the Gaussians in world space.
+    #the rasterizer receives deformed 3D positions (i.e., original_xyz + learned_offset) rather than the original positions.
+
+    ### If precomputed 2d means are provided, use them. Otherwise, compute them from the 3D means.-> copilot addon??
+    ##########Emma's additions end##########
+
     means2D = screenspace_points
     opacity = pc.get_opacity
 

@@ -51,7 +51,7 @@ class GaussianModel:
 
         ##############Emma's Additions####################
         self._deformation = None  # Will be set in training or loading
-        
+
 
         ###########Emma's Additions End###################
 
@@ -139,6 +139,20 @@ class GaussianModel:
     @property
     def get_exposure(self):
         return self._exposure
+    
+    ##############Emma's Additions####################    
+    
+    @property
+    def get_deformed_xyz(self):
+        # ensures existing code continues to work, but geometry-aware stylization can query the deformed positions.
+
+
+        if self._deformation is None:
+            return self._xyz
+        return self._xyz + self._deformation
+    
+
+    ###########Emma's Additions End###################
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
@@ -160,6 +174,14 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
+
+        ##############Emma's Additions####################
+        self._deformation = nn.Parameter(torch.zeros_like(self._xyz).requires_grad_(True)) #initiates deformation offsets to zero, aka no deformation
+
+
+        ###########Emma's Additions End###################
+
+
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -193,7 +215,13 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+
+            ##############Emma's Additions####################
+            {'params': [self._deformation], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "deform"} # to optimize the deformation offsets along with all the other parameters.
+            # Note: this is not the most efficient way to do this, but it is the simplest and works for now. -> this was added in by copilot??
+            ###########Emma's Additions End###################
+
         ]
 
         if self.optimizer_type == "default":
