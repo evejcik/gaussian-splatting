@@ -401,6 +401,9 @@ class GaussianModel:
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
+        self._deformation = nn.Parameter(self._deformation[valid_points_mask].requires_grad_(True))
+
+
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
@@ -433,7 +436,8 @@ class GaussianModel:
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "deform": torch.zeros_like(new_xyz)}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -443,10 +447,19 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # Extend _deformation manually
+        self._deformation = nn.Parameter(torch.cat([
+            self._deformation,
+            torch.zeros_like(new_xyz, device="cuda")  # initialize new deformations as zeros
+        ], dim=0).requires_grad_(True))
+
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        
+
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
