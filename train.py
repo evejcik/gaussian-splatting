@@ -22,6 +22,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from PIL import Image
+import numpy as np
+import torchvision.transforms as T
 
 from transformers import AutoImageProcessor, DINOv2Model
 import torch.nn.functional as F
@@ -45,6 +48,84 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+
+# ─── Configuration ────────────────────────────────────────────────────────────────
+# Paths to your style inputs
+style_rgb_path   = "gaussian_splatting/style/starrynight.jpg"
+style_depth_path = "style_depth.npy"  # the .npy you generated with ZoeDepth
+
+# Your render / training resolution (must match what your NeRF / splatting uses)
+render_width  = 800
+render_height = 600
+
+# … any other configs (learning rates, checkpoints, etc.) …
+# ───────────────────────────────────────────────────────────────────────────────────
+
+def prepare_style_inputs(rgb_path, depth_npy_path, target_resolution=(800, 800), device="cuda"):
+    """
+    Load and resize the style image and depth map, then extract DINOv2 features.
+
+    Args:
+        rgb_path (str): Path to the style image.
+        depth_npy_path (str): Path to the depth map (.npy).
+        target_resolution (tuple): (width, height) to resize to.
+        device (str): Device to load tensors on ("cuda" or "cpu").
+
+    Returns:
+        Tuple[Tensor, Tensor]: style_rgb_feats, style_depth_feats of shape [1, N, 768]
+    """
+    W, H = target_resolution
+
+    # Load and resize style RGB
+    style_rgb = Image.open(rgb_path).convert("RGB")
+    style_rgb = style_rgb.resize((W, H), Image.BICUBIC)
+
+    # Load and resize depth
+    depth_array = np.load(depth_npy_path)
+    depth_img = Image.fromarray((depth_array / depth_array.max() * 255).astype(np.uint8))
+    depth_img = depth_img.resize((W, H), Image.BICUBIC)
+
+    # Load DINOv2 processor and model
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    model = DINOv2Model.from_pretrained("facebook/dinov2-base").to(device).eval()
+
+    # Preprocess for DINO
+    rgb_tensor = processor(images=style_rgb, return_tensors="pt")["pixel_values"].to(device)
+    depth_tensor = processor(images=depth_img, return_tensors="pt")["pixel_values"].to(device)
+
+    # Extract features
+    with torch.no_grad():
+        style_rgb_feats = model(rgb_tensor).last_hidden_state  # [1, N, 768]
+        style_depth_feats = model(depth_tensor).last_hidden_state
+
+    return style_rgb_feats, style_depth_feats
+
+
+def prepare_rendered_image_for_dino(rendered_tensor, resolution):
+    """
+    rendered_tensor: torch.Tensor of shape [3, H, W] (RGB) or [1, H, W] (grayscale/depth)
+    resolution: tuple (W, H) — resolution to resize to before feeding into DINOv2
+
+    Returns:
+        torch.Tensor of shape [1, 3, 224, 224] — normalized for DINOv2
+    """
+    W, H = resolution
+
+    if rendered_tensor.shape[0] == 1:
+        # Convert grayscale depth to RGB-like 3 channel
+        rendered_tensor = rendered_tensor.repeat(3, 1, 1)
+
+    # Clamp if needed
+    rendered_tensor = rendered_tensor.clamp(0, 1)
+
+    # Resize and normalize for DINOv2
+    transform_dino = T.Compose([
+        T.Resize((224, 224), antialias=True),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    return transform_dino(rendered_tensor).unsqueeze(0).cuda()  # [1, 3, 224, 224]
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     #############Emma's addition###############
     # Load DINOv2 model for feature extraction
@@ -52,14 +133,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     dinov2 = DINOv2Model.from_pretrained("facebook/dinov2-base").cuda()
     dinov2.eval()
 
-    def extract_dino_features(img_tensor):
+    # Cache for style features at different resolutions
+    style_feature_cache = {}  # {(width, height): (style_rgb_feats, style_depth_feats)}
+
+
+    def extract_dino_features(img_tensor): #get features from DINOv2 model - depth map
         """Expects img_tensor: [1, 3, H, W] in [0,1]"""
         inputs = processor(images=img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy(), return_tensors="pt")['pixel_values'].cuda()
         with torch.no_grad():
             outputs = dinov2(inputs)
         return outputs.last_hidden_state  # shape: [1, num_patches, 768]
 
-    def cosine_patch_loss(feats_A, feats_B):
+    def cosine_patch_loss(feats_A, feats_B): #is this style loss?
+        """Computes cosine similarity between two sets of features"""
         A = F.normalize(feats_A, dim=-1)
         B = F.normalize(feats_B, dim=-1)
         return 1 - (A * B).sum(-1).mean()
@@ -74,6 +160,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -84,20 +172,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ####Emma's addition####
 
      # Load and prepare style image and depth
-    from PIL import Image
-    import numpy as np
 
-    style_rgb = Image.open("path/to/your_style_image.jpg").convert("RGB").resize((512, 512))
-    style_depth = np.load("path/to/your_style_depth.npy")  # shape: [H, W]
-    style_depth_img = Image.fromarray((style_depth / style_depth.max() * 255).astype(np.uint8)).convert("RGB").resize((512, 512))
+    # style_rgb = Image.open("path/to/your_style_image.jpg").convert("RGB").resize((512, 512)) -> this is the manual loading of style image & depth, we want to be able to do it dynamically to fit each camera's resolution
+    # style_depth = np.load("path/to/your_style_depth.npy")  # shape: [H, W]
+    # style_depth_img = Image.fromarray((style_depth / style_depth.max() * 255).astype(np.uint8)).convert("RGB").resize((512, 512))
 
     # Extract style features
-    style_rgb_tensor = processor(images=style_rgb, return_tensors="pt")['pixel_values'].cuda()
-    style_depth_tensor = processor(images=style_depth_img, return_tensors="pt")['pixel_values'].cuda()
+    # style_rgb_tensor = processor(images=style_rgb, return_tensors="pt")['pixel_values'].cuda()
+    # style_depth_tensor = processor(images=style_depth_img, return_tensors="pt")['pixel_values'].cuda()
 
-    with torch.no_grad():
-        style_rgb_feats = dinov2(style_rgb_tensor).last_hidden_state  # [1, N, 768]
-        style_depth_feats = dinov2(style_depth_tensor).last_hidden_state  # [1, N, 768]
+    # with torch.no_grad():
+    #     style_rgb_feats = dinov2(style_rgb_tensor).last_hidden_state  # [1, N, 768]
+    #     style_depth_feats = dinov2(style_depth_tensor).last_hidden_state  # [1, N, 768]
 
     ####Emma's addition end####
 
@@ -114,7 +200,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):
+    for iteration in range(first_iter, opt.iterations + 1): #training loop starts here
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -144,6 +230,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
+
+        ###Emma's addition###
+        # Match current training view resolution
+        target_resolution = (viewpoint_cam.image_width, viewpoint_cam.image_height)
+
+        # Check cache first
+        if target_resolution in style_feature_cache:
+            style_rgb_feats, style_depth_feats = style_feature_cache[target_resolution]
+        else:
+            # Resize + extract features once for this resolution
+            style_rgb_feats, style_depth_feats = prepare_style_inputs(
+                rgb_path=style_rgb_path,
+                depth_npy_path=style_depth_path,
+                target_resolution=target_resolution,
+                device="cuda"
+            )
+            style_feature_cache[target_resolution] = (style_rgb_feats, style_depth_feats)
+
+
+        ###Emm's addition end###
+
         vind = viewpoint_indices.pop(rand_idx)
 
         # Render
@@ -156,25 +263,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
 
-        #####Emma's addition#####
+        ###Style Loss Block Start###
 
-         # ----- Extract DINOv2 features from RGB and Depth -----
-        render_rgb = image.unsqueeze(0)  # [1, 3, H, W]
-        render_depth = render_pkg["depth"].repeat(3, 1, 1).unsqueeze(0)  # [1, 3, H, W]
+        # Match style resolution dynamically #check in output/.../cameras.json for camera resolutions
+        target_resolution = (viewpoint_cam.image_width, viewpoint_cam.image_height)
 
-        # Normalize depth
-        render_depth = (render_depth - render_depth.min()) / (render_depth.max() - render_depth.min() + 1e-5)
+        # Extract rendered outputs -> the rendered RGB and depth maps
+        rendered_rgb = render_pkg["render"]
+        rendered_depth = render_pkg["depth"]
+
+        # Resize + normalize for DINOv2
+        rgb_input = prepare_rendered_image_for_dino(rendered_rgb, target_resolution)
+        depth_input = prepare_rendered_image_for_dino(rendered_depth, target_resolution)
 
         # Extract features
-        rgb_feats = extract_dino_features(render_rgb)
-        depth_feats = extract_dino_features(render_depth)
+        with torch.no_grad():
+            rendered_rgb_feats = dinov2(rgb_input).last_hidden_state
+            rendered_depth_feats = dinov2(depth_input).last_hidden_state
 
-        # Compute style loss
-        style_loss_rgb = cosine_patch_loss(rgb_feats, style_rgb_feats)
-        style_loss_depth = cosine_patch_loss(depth_feats, style_depth_feats)
 
-        style_loss = 1.0 * style_loss_rgb + 1.0 * style_loss_depth  # tune weights as needed
-        loss += style_loss
+
+        # Compute cosine similarity loss
+        style_loss_rgb = cosine_patch_loss(rendered_rgb_feats, style_rgb_feats)
+        style_loss_depth = cosine_patch_loss(rendered_depth_feats, style_depth_feats)
+
+        # Weight and add to total loss
+        style_weight_rgb = getattr(opt, "style_rgb_weight", 1.0)
+        style_weight_depth = getattr(opt, "style_depth_weight", 1.0)
+        loss += style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth
+
 
 
         #####Emma's addition end#####

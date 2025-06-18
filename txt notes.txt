@@ -1,0 +1,23 @@
+1. Get color grid and density grid from sceneby training the Gaussian splatting model
+2. 
+
+3. should i add gaussians.get_deformed_xyz to every instance of gaussians.get_xyz?
+
+4. where is xyz being set to gaussians.get_xyz?
+
+5. do i need to add self.get_deformed_xyz to the OptimizationParams in __init__.py?
+
+6. dinov2 is only used during training - this is why the helper functions are within the training function, but they can also go outside, it's just a bit cleaner this way
+
+7. using zoedepth to get depth mapXX
+
+8. need depth map, gaussian, and the style image resolutions all match up, especially for dino and for patch-wise comparisons.
+
+To minimize mismatched resolutions, I could: Interpolate features to align tokens (e.g., reshape with bicubic), Use nearest-neighbor patch matching instead of cosine loss, or Embed both into a shared space and use CLIP-like feature distance (less spatially sensitive). I could do any of these in addition to resizing early.
+
+2efe cameras.json (under output): height: 848, height: 1277
+4ee9: width: 1001, height: 740
+84e8:
+4621:
+aa00:
+f96c:
