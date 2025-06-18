@@ -182,24 +182,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    ####Emma's addition####
-
-     # Load and prepare style image and depth
-
-    # style_rgb = Image.open("path/to/your_style_image.jpg").convert("RGB").resize((512, 512)) -> this is the manual loading of style image & depth, we want to be able to do it dynamically to fit each camera's resolution
-    # style_depth = np.load("path/to/your_style_depth.npy")  # shape: [H, W]
-    # style_depth_img = Image.fromarray((style_depth / style_depth.max() * 255).astype(np.uint8)).convert("RGB").resize((512, 512))
-
-    # Extract style features
-    # style_rgb_tensor = processor(images=style_rgb, return_tensors="pt")['pixel_values'].cuda()
-    # style_depth_tensor = processor(images=style_depth_img, return_tensors="pt")['pixel_values'].cuda()
-
-    # with torch.no_grad():
-    #     style_rgb_feats = dinov2(style_rgb_tensor).last_hidden_state  # [1, N, 768]
-    #     style_depth_feats = dinov2(style_depth_tensor).last_hidden_state  # [1, N, 768]
-
-    ####Emma's addition end####
-
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -294,6 +276,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             rendered_rgb_feats = dinov2(rgb_input).last_hidden_state
             rendered_depth_feats = dinov2(depth_input).last_hidden_state
 
+        if tb_writer and iteration % 100 == 0:  # every 100 iters
+            tb_writer.add_images("rendered_output", image.unsqueeze(0), iteration)
+
+
 
 
         # Compute cosine similarity loss
@@ -303,6 +289,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Weight and add to total loss
         style_weight_rgb = getattr(opt, "style_rgb_weight", 1.0)
         style_weight_depth = getattr(opt, "style_depth_weight", 1.0)
+
+        if tb_writer:
+            tb_writer.add_scalar("style_loss/rgb", style_loss_rgb.item(), iteration)
+            tb_writer.add_scalar("style_loss/depth", style_loss_depth.item(), iteration)
+
         
 
 
@@ -474,6 +465,12 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+
+    parser.add_argument("--style_rgb_path", type=str)
+    parser.add_argument("--style_depth_path", type=str)
+    parser.add_argument("--style_rgb_weight", type=float, default=1.0)
+    parser.add_argument("--style_depth_weight", type=float, default=1.0)
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
