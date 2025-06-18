@@ -54,9 +54,22 @@ except:
 style_rgb_path   = "gaussian_splatting/style/starrynight.jpg"
 style_depth_path = "style_depth.npy"  # the .npy you generated with ZoeDepth
 
-# Your render / training resolution (must match what your NeRF / splatting uses)
-render_width  = 800
-render_height = 600
+assert os.path.exists(style_rgb_path), f"Style image not found at {style_rgb_path}"
+assert os.path.exists(style_depth_path), f"Style depth map (.npy) not found at {style_depth_path}"
+
+try:
+    _ = Image.open(style_rgb_path)
+except Exception as e:
+    raise ValueError(f"Failed to open style image: {style_rgb_path}\nError: {e}")
+
+try:
+    _ = np.load(style_depth_path)
+except Exception as e:
+    raise ValueError(f"Failed to load style depth map: {style_depth_path}\nError: {e}")
+
+
+# Your render / training resolution 
+# Training resolution is set dynamically from viewpoint_cam resolution
 
 # … any other configs (learning rates, checkpoints, etc.) …
 # ───────────────────────────────────────────────────────────────────────────────────
@@ -290,7 +303,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Weight and add to total loss
         style_weight_rgb = getattr(opt, "style_rgb_weight", 1.0)
         style_weight_depth = getattr(opt, "style_depth_weight", 1.0)
-        loss += style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth
+        
 
 
 
@@ -309,32 +322,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss += style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth
 
         # Depth regularization 
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]   # depth map in camera space # pulls the depth map from the render() call:
 
-
-            #######Emma's addition########
-
-            # Convert depth to 3-channel for DINOv2
-            depth_rgb = invDepth.repeat(3, 1, 1).unsqueeze(0)  # Shape: [1, 3, H, W]
-
-            # Normalize if needed (optional, for stable feature extraction)
-            depth_rgb = (depth_rgb - depth_rgb.min()) / (depth_rgb.max() - depth_rgb.min() + 1e-5)
-
-            # Extract DINOv2 features
-            rendered_rgb = image.unsqueeze(0)   # [1, 3, H, W], already rendered from Gaussians
-            depth_feats = dinov2(depth_rgb)
-            rgb_feats = dinov2(rendered_rgb)
-
-            # Use target features (style) precomputed from your RGB-D style image
-            loss_style_rgb = cosine_patch_loss(rgb_feats, style_rgb_feats)
-            loss_style_depth = cosine_patch_loss(depth_feats, style_depth_feats)
-
-            # Add to total loss
-            loss += style_weight_rgb * loss_style_rgb + style_weight_depth * loss_style_depth
 
             #######Emma's addition end####
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
@@ -427,6 +421,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('train_loss_patches/style_rgb', style_loss_rgb.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/style_depth', style_loss_depth.item(), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
