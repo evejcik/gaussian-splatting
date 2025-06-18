@@ -26,7 +26,14 @@ from PIL import Image
 import numpy as np
 import torchvision.transforms as T
 
-from transformers import AutoImageProcessor, DINOv2Model
+# from transformers import AutoImageProcessor, DINOv2Model
+# from transformers import AutoImageProcessor, CLIPProcessor, CLIPModel
+
+import torchvision.models as models
+import torch.nn as nn
+
+
+
 import torch.nn.functional as F
 
 
@@ -49,10 +56,35 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
+# args:
+parser = ArgumentParser(description="Training script parameters")
+lp = ModelParams(parser)
+op = OptimizationParams(parser)
+pp = PipelineParams(parser)
+parser.add_argument('--ip', type=str, default="127.0.0.1")
+parser.add_argument('--port', type=int, default=6009)
+parser.add_argument('--debug_from', type=int, default=-1)
+parser.add_argument('--detect_anomaly', action='store_true', default=False)
+parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+parser.add_argument("--quiet", action="store_true")
+parser.add_argument('--disable_viewer', action='store_true', default=False)
+parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+parser.add_argument("--start_checkpoint", type=str, default = None)
+
+parser.add_argument("--style_rgb_path", type=str)
+parser.add_argument("--style_depth_path", type=str)
+parser.add_argument("--style_rgb_weight", type=float, default=1.0)
+parser.add_argument("--style_depth_weight", type=float, default=1.0)
+
+args = parser.parse_args(sys.argv[1:])
+
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────────
 # Paths to your style inputs
-style_rgb_path   = "gaussian_splatting/style/starrynight.jpg"
-style_depth_path = "style_depth.npy"  # the .npy you generated with ZoeDepth
+style_rgb_path   = args.style_rgb_path #"gaussian_splatting/style/starrynight.jpg"
+style_depth_path = args.style_depth_path #"style_depth.npy"  # the .npy you generated with ZoeDepth
 
 assert os.path.exists(style_rgb_path), f"Style image not found at {style_rgb_path}"
 assert os.path.exists(style_depth_path), f"Style depth map (.npy) not found at {style_depth_path}"
@@ -72,6 +104,18 @@ except Exception as e:
 # Training resolution is set dynamically from viewpoint_cam resolution
 
 # … any other configs (learning rates, checkpoints, etc.) …
+resnet = models.resnet50(pretrained=True)
+resnet.eval().cuda()
+
+# Remove the final classification layer to get feature maps
+feature_extractor = nn.Sequential(*list(resnet.children())[:-2]).cuda()
+
+resnet_preprocess = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]),
+])
 # ───────────────────────────────────────────────────────────────────────────────────
 
 def prepare_style_inputs(rgb_path, depth_npy_path, target_resolution=(800, 800), device="cuda"):
@@ -98,69 +142,79 @@ def prepare_style_inputs(rgb_path, depth_npy_path, target_resolution=(800, 800),
     depth_img = Image.fromarray((depth_array / depth_array.max() * 255).astype(np.uint8))
     depth_img = depth_img.resize((W, H), Image.BICUBIC)
 
-    # Load DINOv2 processor and model
-    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-    model = DINOv2Model.from_pretrained("facebook/dinov2-base").to(device).eval()
+   
 
-    # Preprocess for DINO
-    rgb_tensor = processor(images=style_rgb, return_tensors="pt")["pixel_values"].to(device)
-    depth_tensor = processor(images=depth_img, return_tensors="pt")["pixel_values"].to(device)
+    rgb_tensor = resnet_preprocess(style_rgb).unsqueeze(0).to(device)
+    depth_img_rgb = depth_img.convert("RGB")  # ensures 3 channels
+    depth_tensor = resnet_preprocess(depth_img_rgb).unsqueeze(0).to(device)
+
 
     # Extract features
     with torch.no_grad():
-        style_rgb_feats = model(rgb_tensor).last_hidden_state  # [1, N, 768]
-        style_depth_feats = model(depth_tensor).last_hidden_state
+        style_rgb_feats = feature_extractor(rgb_tensor)
+        style_depth_feats = feature_extractor(depth_tensor)
 
     return style_rgb_feats, style_depth_feats
 
 
-def prepare_rendered_image_for_dino(rendered_tensor, resolution):
-    """
+
+def prepare_rendered_image_for_ResNet(rendered_tensor, resolution):
+        """
     rendered_tensor: torch.Tensor of shape [3, H, W] (RGB) or [1, H, W] (grayscale/depth)
     resolution: tuple (W, H) — resolution to resize to before feeding into DINOv2
 
     Returns:
         torch.Tensor of shape [1, 3, 224, 224] — normalized for DINOv2
     """
-    W, H = resolution
+        if rendered_tensor.shape[0] == 1:
+            rendered_tensor = rendered_tensor.repeat(3, 1, 1)
 
-    if rendered_tensor.shape[0] == 1:
-        # Convert grayscale depth to RGB-like 3 channel
-        rendered_tensor = rendered_tensor.repeat(3, 1, 1)
+        rendered_tensor = rendered_tensor.clamp(0, 1).unsqueeze(0)  # [1, 3, H, W]
 
-    # Clamp if needed
-    rendered_tensor = rendered_tensor.clamp(0, 1)
+        # Resize using F.interpolate for tensor input
+        rendered_tensor = F.interpolate(rendered_tensor, size=(224, 224), mode='bilinear', align_corners=False)
 
-    # Resize and normalize for DINOv2
-    transform_dino = T.Compose([
-        T.Resize((224, 224), antialias=True),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+        # Normalize manually
+        mean = torch.tensor([0.485, 0.456, 0.406], device=rendered_tensor.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=rendered_tensor.device).view(1, 3, 1, 1)
+        rendered_tensor = (rendered_tensor - mean) / std
 
-    return transform_dino(rendered_tensor).unsqueeze(0).cuda()  # [1, 3, 224, 224]
+        return rendered_tensor  # shape: [1, 3, 224, 224]
+
+
+def extract_resnet_features(img: Image.Image) -> torch.Tensor:
+    input_tensor = resnet_preprocess(img).unsqueeze(0).cuda()  # shape: [1, 3, 224, 224]
+    with torch.no_grad():
+        features = feature_extractor(input_tensor)  # shape: [1, 2048, 7, 7]
+    return features
+
+def flatten_features(feats):
+    return feats.view(feats.size(0), feats.size(1), -1).permute(0, 2, 1)  # [1, N, C]
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     #############Emma's addition###############
-    # Load DINOv2 model for feature extraction
-    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-    dinov2 = DINOv2Model.from_pretrained("facebook/dinov2-base").cuda()
-    dinov2.eval()
 
+
+    feature_extractor.eval()
     # Cache for style features at different resolutions
     style_feature_cache = {}  # {(width, height): (style_rgb_feats, style_depth_feats)}
 
 
-    def extract_dino_features(img_tensor): #get features from DINOv2 model - depth map
-        """Expects img_tensor: [1, 3, H, W] in [0,1]"""
-        inputs = processor(images=img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy(), return_tensors="pt")['pixel_values'].cuda()
-        with torch.no_grad():
-            outputs = dinov2(inputs)
-        return outputs.last_hidden_state  # shape: [1, num_patches, 768]
 
-    def cosine_patch_loss(feats_A, feats_B): #is this style loss?
-        """Computes cosine similarity between two sets of features"""
-        A = F.normalize(feats_A, dim=-1)
-        B = F.normalize(feats_B, dim=-1)
+
+    def cosine_patch_loss(A, B):
+        """
+        Compute cosine loss between two sets of feature tensors.
+        A and B should have shape [B, C] or [B, C, H, W] (will be pooled if needed).
+        """
+        # If input has spatial dimensions, apply global average pooling
+        if A.ndim == 4:
+            A = F.adaptive_avg_pool2d(A, 1).squeeze(-1).squeeze(-1)  # [B, C]
+        if B.ndim == 4:
+            B = F.adaptive_avg_pool2d(B, 1).squeeze(-1).squeeze(-1)  # [B, C]
+
+        A = F.normalize(A, dim=-1)
+        B = F.normalize(B, dim=-1)
         return 1 - (A * B).sum(-1).mean()
     
 ##############Emma's addition end###############
@@ -267,14 +321,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rendered_rgb = render_pkg["render"]
         rendered_depth = render_pkg["depth"]
 
-        # Resize + normalize for DINOv2
-        rgb_input = prepare_rendered_image_for_dino(rendered_rgb, target_resolution)
-        depth_input = prepare_rendered_image_for_dino(rendered_depth, target_resolution)
+        # Resize + normalize for ResNet
+        rgb_input = prepare_rendered_image_for_ResNet(rendered_rgb, target_resolution)
+        depth_input = prepare_rendered_image_for_ResNet(rendered_depth, target_resolution)
+
+        if depth_input.shape[1] == 1: #since resnet & clip expect 3 channels because they are trained on rgb, unlike dinov2 which can take 1 channel input
+            depth_input = depth_input.repeat(1, 3, 1, 1)
+
 
         # Extract features
         with torch.no_grad():
-            rendered_rgb_feats = dinov2(rgb_input).last_hidden_state
-            rendered_depth_feats = dinov2(depth_input).last_hidden_state
+            rgb_feats = feature_extractor(rgb_input)
+            depth_feats = feature_extractor(depth_input)
+
+                # Reshape to match style features: [1, 49, 2048]
+        rendered_rgb_feats = flatten_features(rgb_feats)
+        rendered_depth_feats = flatten_features(depth_feats)
 
         if tb_writer and iteration % 100 == 0:  # every 100 iters
             tb_writer.add_images("rendered_output", image.unsqueeze(0), iteration)
@@ -293,6 +355,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if tb_writer:
             tb_writer.add_scalar("style_loss/rgb", style_loss_rgb.item(), iteration)
             tb_writer.add_scalar("style_loss/depth", style_loss_depth.item(), iteration)
+            tb_writer.add_scalar("train_loss_patches/style_rgb", style_loss_rgb.item(), iteration)
+            tb_writer.add_scalar("train_loss_patches/style_depth", style_loss_depth.item(), iteration)
+
 
         
 
@@ -412,8 +477,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
-        tb_writer.add_scalar('train_loss_patches/style_rgb', style_loss_rgb.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/style_depth', style_loss_depth.item(), iteration)
+        # tb_writer.add_scalar('train_loss_patches/style_rgb', style_loss_rgb.item(), iteration)
+        # tb_writer.add_scalar('train_loss_patches/style_depth', style_loss_depth.item(), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -451,27 +516,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
 if __name__ == "__main__":
     # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-
-    parser.add_argument("--style_rgb_path", type=str)
-    parser.add_argument("--style_depth_path", type=str)
-    parser.add_argument("--style_rgb_weight", type=float, default=1.0)
-    parser.add_argument("--style_depth_weight", type=float, default=1.0)
-
-    args = parser.parse_args(sys.argv[1:])
+   
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)

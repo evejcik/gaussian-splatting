@@ -70,6 +70,8 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # self._deformation = torch.zeros_like(self._xyz, requires_grad=True)
+
         self.setup_functions()
 
     def capture(self):
@@ -193,6 +195,11 @@ class GaussianModel:
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+
+        # Emma's addition: initialize deformation after _xyz is defined
+        self._deformation = nn.Parameter(torch.zeros_like(self._xyz, device="cuda").requires_grad_(True))
+
+
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
