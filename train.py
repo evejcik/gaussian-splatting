@@ -31,7 +31,7 @@ import torchvision.transforms as T
 
 import torchvision.models as models
 import torch.nn as nn
-
+from torchvision import transforms
 
 
 import torch.nn.functional as F
@@ -117,6 +117,36 @@ resnet_preprocess = T.Compose([
                 std=[0.229, 0.224, 0.225]),
 ])
 # ───────────────────────────────────────────────────────────────────────────────────
+
+
+# --- VGG Class ---------------------------------------------------------------------
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, layers=None):
+        super(VGGPerceptualLoss, self).__init__()
+        vgg = models.vgg19(pretrained=True).features.eval()
+        for param in vgg.parameters():
+            param.requires_grad = False
+        
+        self.blocks = nn.ModuleList([
+            vgg[:4].eval(),   # relu1_1
+            vgg[4:9].eval(),  # relu2_1
+            vgg[9:16].eval(), # relu3_1
+            vgg[16:23].eval() # relu4_1
+        ])
+        
+        self.transform = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                              std=[0.229, 0.224, 0.225])
+
+    def forward(self, input, target):
+        input = self.transform(input)
+        target = self.transform(target)
+        loss = 0.0
+        for block in self.blocks:
+            input = block(input)
+            target = block(target)
+            loss += nn.functional.l1_loss(input, target)
+        return loss
+# -----------------------------------------------------------------------------------
 
 def prepare_style_inputs(rgb_path, depth_npy_path, target_resolution=(800, 800), device="cuda"):
     """
