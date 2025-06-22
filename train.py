@@ -37,6 +37,10 @@ from torchvision import transforms
 import torch.nn.functional as F
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -76,6 +80,8 @@ parser.add_argument("--style_rgb_path", type=str)
 parser.add_argument("--style_depth_path", type=str)
 parser.add_argument("--style_rgb_weight", type=float, default=1.0)
 parser.add_argument("--style_depth_weight", type=float, default=1.0)
+parser.add_argument("--vgg_weight", type=float, default=0.0, help="Weight for VGG perceptual loss")
+
 
 args = parser.parse_args(sys.argv[1:])
 
@@ -121,7 +127,7 @@ resnet_preprocess = T.Compose([
 
 # --- VGG Class ---------------------------------------------------------------------
 class VGGPerceptualLoss(nn.Module):
-    def __init__(self, layers=None):
+    def __init__(self):
         super(VGGPerceptualLoss, self).__init__()
         vgg = models.vgg19(pretrained=True).features.eval()
         for param in vgg.parameters():
@@ -134,19 +140,38 @@ class VGGPerceptualLoss(nn.Module):
             vgg[16:23].eval() # relu4_1
         ])
         
-        self.transform = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                              std=[0.229, 0.224, 0.225])
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
-    def forward(self, input, target):
-        input = self.transform(input)
-        target = self.transform(target)
-        loss = 0.0
+    def encode(self, x):
+        x = (x - self.mean) / self.std
+        features = []
         for block in self.blocks:
-            input = block(input)
-            target = block(target)
-            loss += nn.functional.l1_loss(input, target)
+            x = block(x)
+            features.append(x)
+        return features
+
+    def forward(self, input_tensor, target_features):
+        input_features = self.encode(input_tensor)
+        loss = 0.0
+        for inp, tgt in zip(input_features, target_features):
+            loss += F.l1_loss(inp, tgt)
         return loss
-# -----------------------------------------------------------------------------------
+
+    
+def extract_vgg_features(image_tensor, vgg_model):
+    mean = torch.tensor([0.485, 0.456, 0.406], device=image_tensor.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=image_tensor.device).view(1, 3, 1, 1)
+    image_tensor = (image_tensor - mean) / std
+
+    features = []
+    x = image_tensor
+    for block in vgg_model.blocks:
+        x = block(x)
+        features.append(x)
+    return features
+
+    # -----------------------------------------------------------------------------------
 
 def prepare_style_inputs(rgb_path, depth_npy_path, target_resolution=(800, 800), device="cuda"):
     """
@@ -277,6 +302,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    vgg_loss_fn = VGGPerceptualLoss().to(device)
+
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1): #training loop starts here
@@ -355,6 +383,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rgb_input = prepare_rendered_image_for_ResNet(rendered_rgb, target_resolution)
         depth_input = prepare_rendered_image_for_ResNet(rendered_depth, target_resolution)
 
+        # Normalize for VGG
+        vgg_input = F.interpolate(rendered_rgb.unsqueeze(0), size=(224, 224), mode='bilinear')  # ensure shape is [1, 3, H, W]
+
+
+
+        style_image = Image.open(style_rgb_path).convert("RGB")
+        style_image_tensor = T.ToTensor()(style_image).unsqueeze(0).to(device)
+        style_image_tensor = torch.nn.functional.interpolate(style_image_tensor, size=(224, 224), mode='bilinear')
+
+        with torch.no_grad():
+            vgg_target_features = extract_vgg_features(style_image_tensor, vgg_loss_fn)
+
+
         if depth_input.shape[1] == 1: #since resnet & clip expect 3 channels because they are trained on rgb, unlike dinov2 which can take 1 channel input
             depth_input = depth_input.repeat(1, 3, 1, 1)
 
@@ -382,11 +423,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         style_weight_rgb = getattr(opt, "style_rgb_weight", 1.0)
         style_weight_depth = getattr(opt, "style_depth_weight", 1.0)
 
+        # VGG perceptual loss
+        vgg_weight = getattr(opt, "vgg_weight", 1.0)
+        vgg_style_loss = vgg_loss_fn(vgg_input, vgg_target_features)
+
+
+            
+
+        
+
+
         if tb_writer:
             tb_writer.add_scalar("style_loss/rgb", style_loss_rgb.item(), iteration)
             tb_writer.add_scalar("style_loss/depth", style_loss_depth.item(), iteration)
             tb_writer.add_scalar("train_loss_patches/style_rgb", style_loss_rgb.item(), iteration)
             tb_writer.add_scalar("train_loss_patches/style_depth", style_loss_depth.item(), iteration)
+            tb_writer.add_scalar("style_loss/vgg_rgb", vgg_style_loss.item(), iteration)
 
 
         
@@ -409,6 +461,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         loss += style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth
+        # Add to final loss
+        loss += vgg_weight * vgg_style_loss
+
+        
 
         # Depth regularization 
         Ll1depth_pure = 0.0
