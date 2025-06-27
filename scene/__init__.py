@@ -84,7 +84,10 @@ class Scene:
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+
+        #UNCOMMENT THIS LINE TO SAVE THE PLY FILE
+        # self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply")) 
+        
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
             for image_name in self.gaussians.exposure_mapping

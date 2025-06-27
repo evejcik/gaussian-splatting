@@ -10,6 +10,10 @@
 #
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
+
+
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -114,7 +118,7 @@ resnet = models.resnet50(pretrained=True)
 resnet.eval().cuda()
 
 # Remove the final classification layer to get feature maps
-feature_extractor = nn.Sequential(*list(resnet.children())[:-2]).cuda()
+feature_extractor = nn.Sequential(*list(resnet.children())[:-2]).cuda() #strips offthe average pooling and fully connected layers, because we only want the feature maps to compare visual textures and patterns, not class predictions
 
 resnet_preprocess = T.Compose([
     T.Resize((224, 224)),
@@ -257,20 +261,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
 
-    def cosine_patch_loss(A, B):
-        """
-        Compute cosine loss between two sets of feature tensors.
-        A and B should have shape [B, C] or [B, C, H, W] (will be pooled if needed).
-        """
-        # If input has spatial dimensions, apply global average pooling
-        if A.ndim == 4:
-            A = F.adaptive_avg_pool2d(A, 1).squeeze(-1).squeeze(-1)  # [B, C]
-        if B.ndim == 4:
-            B = F.adaptive_avg_pool2d(B, 1).squeeze(-1).squeeze(-1)  # [B, C]
+    # def cosine_patch_loss(A, B):
+    #     """
+    #     Compute cosine loss between two sets of feature tensors.
+    #     A and B should have shape [B, C] or [B, C, H, W] (will be pooled if needed).
+    #     """
+    #     # If input has spatial dimensions, apply global average pooling
+    #     if A.ndim == 4:
+    #         A = F.adaptive_avg_pool2d(A, 1).squeeze(-1).squeeze(-1)  # [B, C]
+    #     if B.ndim == 4:
+    #         B = F.adaptive_avg_pool2d(B, 1).squeeze(-1).squeeze(-1)  # [B, C]
 
-        A = F.normalize(A, dim=-1)
-        B = F.normalize(B, dim=-1)
-        return 1 - (A * B).sum(-1).mean()
+    #     A = F.normalize(A, dim=-1)
+    #     B = F.normalize(B, dim=-1)
+    #     return 1 - (A * B).sum(-1).mean()
+
+def style_patch_loss_l1(A, B):
+    if A.ndim == 4:
+        A = F.adaptive_avg_pool2d(A, 1).squeeze(-1).squeeze(-1)
+    if B.ndim == 4:
+        B = F.adaptive_avg_pool2d(B, 1).squeeze(-1).squeeze(-1)
+    return F.l1_loss(A, B)
+
     
 ##############Emma's addition end###############
 
@@ -401,9 +413,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # Extract features
-        with torch.no_grad():
-            rgb_feats = feature_extractor(rgb_input)
-            depth_feats = feature_extractor(depth_input)
+        #removing rgb feats and depth feats from inside the torch_no_grad() block, so that we can use them for style loss
+        rgb_feats = feature_extractor(rgb_input)
+        depth_feats = feature_extractor(depth_input)
 
                 # Reshape to match style features: [1, 49, 2048]
         rendered_rgb_feats = flatten_features(rgb_feats)
@@ -416,8 +428,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # Compute cosine similarity loss
-        style_loss_rgb = cosine_patch_loss(rendered_rgb_feats, style_rgb_feats)
-        style_loss_depth = cosine_patch_loss(rendered_depth_feats, style_depth_feats)
+        style_loss_rgb = style_patch_loss_l1(rendered_rgb_feats, style_rgb_feats)
+        style_loss_depth = style_patch_loss_l1(rendered_depth_feats, style_depth_feats)
 
         # Weight and add to total loss
         style_weight_rgb = getattr(opt, "style_rgb_weight", 1.0)
@@ -426,6 +438,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # VGG perceptual loss
         vgg_weight = getattr(opt, "vgg_weight", 1.0)
         vgg_style_loss = vgg_loss_fn(vgg_input, vgg_target_features)
+        torch.cuda.empty_cache()
 
 
             
@@ -459,10 +472,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        loss += style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth
-        # Add to final loss
-        loss += vgg_weight * vgg_style_loss
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        # loss += style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth
+        # # Add to final loss
+        # loss += vgg_weight * vgg_style_loss
+
+        loss = style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth + vgg_weight * vgg_style_loss #turning off l1 and dssim for now, since we are not training on a dataset with ground truth images
+
 
         
 
@@ -483,7 +499,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        print("Grad check (should be True):", rgb_feats.requires_grad, vgg_rendered_features[0].requires_grad)
+
         loss.backward()
+        torch.cuda.empty_cache()
 
         iter_end.record()
 
