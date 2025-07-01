@@ -504,8 +504,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         reconstruction_loss = (1 - lambda_dssim) * Ll1 + lambda_dssim * (1 - ssim_value)
 
-        loss = reconstruction_loss + style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth + vgg_weight * vgg_style_loss + Ll1depth #adding back in dssim to see if we can get a clearer image result
-
         # Depth regularization 
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -522,6 +520,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+
+        loss = reconstruction_loss + style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth + vgg_weight * vgg_style_loss + Ll1depth #adding back in dssim to see if we can get a clearer image result
+
+        
 
         # Compute VGG features of the rendered image (no torch.no_grad)
         vgg_rendered_features = vgg_loss_fn.encode(vgg_input)
