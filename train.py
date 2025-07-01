@@ -251,7 +251,15 @@ def flatten_features(feats):
     return feats.view(feats.size(0), feats.size(1), -1).permute(0, 2, 1)  # [1, N, C]
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+    style_feature_cache = {}
     #############Emma's addition###############
+    torch.autograd.set_detect_anomaly(True)
+
+    
+
+
+
 
 
     feature_extractor.eval()
@@ -276,12 +284,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     #     B = F.normalize(B, dim=-1)
     #     return 1 - (A * B).sum(-1).mean()
 
-def style_patch_loss_l1(A, B):
-    if A.ndim == 4:
-        A = F.adaptive_avg_pool2d(A, 1).squeeze(-1).squeeze(-1)
-    if B.ndim == 4:
-        B = F.adaptive_avg_pool2d(B, 1).squeeze(-1).squeeze(-1)
-    return F.l1_loss(A, B)
+    def style_patch_loss_l1(A, B):
+        if A.ndim == 3:  # A is [1, 49, 2048]
+            A = A.mean(dim=1)  # -> [1, 2048]
+        if B.ndim == 3:
+            B = B.mean(dim=1)
+        return F.l1_loss(A, B)
+
 
     
 ##############Emma's addition end###############
@@ -297,8 +306,9 @@ def style_patch_loss_l1(A, B):
 
     
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+          (model_params, first_iter) = torch.load(checkpoint)
+          gaussians.restore(model_params, opt)
+          print(f"[Checkpoint loaded] Resuming from iteration {first_iter}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -365,7 +375,11 @@ def style_patch_loss_l1(A, B):
                 target_resolution=target_resolution,
                 device="cuda"
             )
-            style_feature_cache[target_resolution] = (style_rgb_feats, style_depth_feats)
+
+            style_rgb_feats = flatten_features(style_rgb_feats)
+            style_depth_feats = flatten_features(style_depth_feats)
+
+        print("Extracting style features with shape:", style_rgb_feats.shape)
 
 
         ###Emm's addition end###
@@ -428,6 +442,9 @@ def style_patch_loss_l1(A, B):
 
 
         # Compute cosine similarity loss
+
+        print("Rendered feats shape:", rendered_rgb_feats.shape)
+        print("Style feats shape:", style_rgb_feats.shape)
         style_loss_rgb = style_patch_loss_l1(rendered_rgb_feats, style_rgb_feats)
         style_loss_depth = style_patch_loss_l1(rendered_depth_feats, style_depth_feats)
 
@@ -460,9 +477,14 @@ def style_patch_loss_l1(A, B):
 
         #####Emma's addition end#####
 
+        # if viewpoint_cam.alpha_mask is not None:
+        #     alpha_mask = viewpoint_cam.alpha_mask.cuda()
+        #     image *= alpha_mask
+
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+            image = image * alpha_mask  # NOT inplace anymore
+
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -477,10 +499,12 @@ def style_patch_loss_l1(A, B):
         # # Add to final loss
         # loss += vgg_weight * vgg_style_loss
 
-        loss = style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth + vgg_weight * vgg_style_loss #turning off l1 and dssim for now, since we are not training on a dataset with ground truth images
+        # loss = style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth + vgg_weight * vgg_style_loss #turning off l1 and dssim for now, since we are not training on a dataset with ground truth images
+        lambda_dssim = opt.lambda_dssim  # e.g., 0.2
 
+        reconstruction_loss = (1 - lambda_dssim) * Ll1 + lambda_dssim * (1 - ssim_value)
 
-        
+        loss = reconstruction_loss + style_weight_rgb * style_loss_rgb + style_weight_depth * style_loss_depth + vgg_weight * vgg_style_loss + Ll1depth #adding back in dssim to see if we can get a clearer image result
 
         # Depth regularization 
         Ll1depth_pure = 0.0
@@ -498,6 +522,10 @@ def style_patch_loss_l1(A, B):
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+
+        # Compute VGG features of the rendered image (no torch.no_grad)
+        vgg_rendered_features = vgg_loss_fn.encode(vgg_input)
+  
 
         print("Grad check (should be True):", rgb_feats.requires_grad, vgg_rendered_features[0].requires_grad)
 
