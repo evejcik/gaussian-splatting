@@ -254,7 +254,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     style_feature_cache = {}
     #############Emma's addition###############
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     
 
@@ -378,6 +378,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             style_rgb_feats = flatten_features(style_rgb_feats)
             style_depth_feats = flatten_features(style_depth_feats)
+
+        style_depth_feats = style_depth_feats.detach()
+        style_rgb_feats = style_rgb_feats.detach()
+
 
         print("Extracting style features with shape:", style_rgb_feats.shape)
 
@@ -525,11 +529,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         
 
+
+        
+
         # Compute VGG features of the rendered image (no torch.no_grad)
         vgg_rendered_features = vgg_loss_fn.encode(vgg_input)
   
 
         print("Grad check (should be True):", rgb_feats.requires_grad, vgg_rendered_features[0].requires_grad)
+
+        # Free up GPU memory from style feature tensors (if no longer needed)
+        del rendered_rgb_feats, style_rgb_feats, vgg_input  # or any other large tensor not needed now
+        torch.cuda.empty_cache()
 
         loss.backward()
         torch.cuda.empty_cache()
