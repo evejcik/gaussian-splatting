@@ -86,6 +86,10 @@ parser.add_argument("--style_rgb_weight", type=float, default=1.0)
 parser.add_argument("--style_depth_weight", type=float, default=1.0)
 parser.add_argument("--vgg_weight", type=float, default=0.0, help="Weight for VGG perceptual loss")
 
+parser.add_argument("--source_depth_dir", type=str, default=None, help="Path to directory of precomputed training image depth .npy files")
+
+
+
 
 args = parser.parse_args(sys.argv[1:])
 
@@ -450,7 +454,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("Rendered feats shape:", rendered_rgb_feats.shape)
         print("Style feats shape:", style_rgb_feats.shape)
         style_loss_rgb = style_patch_loss_l1(rendered_rgb_feats, style_rgb_feats)
-        style_loss_depth = style_patch_loss_l1(rendered_depth_feats, style_depth_feats)
+        # style_loss_depth = style_patch_loss_l1(rendered_depth_feats, style_depth_feats) #commenting out to add masked depth style loss
+
+        # Optional: load or compute a depth mask (1 if reliable, 0 if not). For now assume one is available.
+        # You could use: viewpoint_cam.depth_mask if reliable, or create one from rendered_depth.
+
+        # Assume mask shape: [H, W] or [1, 1, H, W] → flatten to match feature shape if needed
+        depth_mask = viewpoint_cam.depth_mask.cuda()  # shape [H, W]
+
+        # Resize mask to match features (e.g., 7x7 if ResNet flattening produces [1, 49, C])
+        mask_resized = F.interpolate(depth_mask.unsqueeze(0).unsqueeze(0).float(), size=(7, 7), mode="nearest")
+        mask_flat = mask_resized.view(1, -1)  # shape [1, 49]
+
+        # Apply mask to both style and rendered depth features
+        masked_rendered = rendered_depth_feats * mask_flat.unsqueeze(-1)  # [1, 49, C]
+        masked_style = style_depth_feats * mask_flat.unsqueeze(-1)        # [1, 49, C]
+
+        # Normalize by sum of mask to avoid trivial zero-loss
+        valid_count = mask_flat.sum() + 1e-6
+        style_loss_depth = F.l1_loss(masked_rendered, masked_style, reduction='sum') / valid_count
+
 
         # Weight and add to total loss
         style_weight_rgb = getattr(opt, "style_rgb_weight", 1.0)
@@ -476,6 +499,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         
+        print("Masked style depth loss:", style_loss_depth.item())
+        tb_writer.add_scalar("masked_style_loss/depth", style_loss_depth.item(), iteration)
 
 
 
@@ -515,8 +540,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
             #######Emma's addition end####
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
+            # mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+            # depth_mask = viewpoint_cam.depth_mask.cuda()
+
+
+            #Update train.py to load per-image reference depths from ZoeDepth outputs
+
+            depth_path = os.path.join(opt.source_depth_dir, f"{viewpoint_cam.image_name}.npy")
+            mono_invdepth = torch.from_numpy(np.load(depth_path)).float().cuda()
+
 
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
             Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
