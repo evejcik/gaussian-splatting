@@ -69,6 +69,7 @@ parser = ArgumentParser(description="Training script parameters")
 lp = ModelParams(parser)
 op = OptimizationParams(parser)
 pp = PipelineParams(parser)
+
 parser.add_argument('--ip', type=str, default="127.0.0.1")
 parser.add_argument('--port', type=int, default=6009)
 parser.add_argument('--debug_from', type=int, default=-1)
@@ -86,12 +87,13 @@ parser.add_argument("--style_rgb_weight", type=float, default=1.0)
 parser.add_argument("--style_depth_weight", type=float, default=1.0)
 parser.add_argument("--vgg_weight", type=float, default=0.0, help="Weight for VGG perceptual loss")
 
-parser.add_argument("--source_depth_dir", type=str, default=None, help="Path to directory of precomputed training image depth .npy files")
+# parser.add_argument("--source_depth_dir", type=str, default=None, help="Path to directory of precomputed training image depth .npy files")
 
 
 
 
 args = parser.parse_args(sys.argv[1:])
+model = lp.extract(args) 
 
 
 
@@ -305,7 +307,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    
+    # Initialize scene - only load from path if we have a checkpoint
+    # Initialize scene
+    if checkpoint:
+        # If loading from checkpoint, extract iteration number from checkpoint filename
+        # Checkpoint filename format is usually "chkpnt{iteration}.pth"
+        import re
+        match = re.search(r'chkpnt(\d+)\.pth', checkpoint)
+        if match:
+            load_iter = int(match.group(1))
+            scene = Scene(dataset, gaussians, load_iteration=load_iter)
+        else:
+            # Fallback: try to find the latest iteration
+            scene = Scene(dataset, gaussians, load_iteration=-1)
+    else:
+        # Fresh training - no checkpoint loading
+        scene = Scene(dataset, gaussians, load_iteration=None)
+
+    # Set the model path for saving (this is separate from loading)
+    scene.model_path = dataset.model_path
+
+
+
     gaussians.training_setup(opt)
 
     
@@ -706,6 +730,8 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    print("DEBUG ARGS:", vars(args))
+
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done

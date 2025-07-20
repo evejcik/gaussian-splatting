@@ -15,12 +15,13 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import PILtoTorch
 import cv2
+import os
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 train_test_exp = False, is_test_dataset = False, is_test_view = False,  source_depth_dir=None
                  ):
         super(Camera, self).__init__()
 
@@ -31,6 +32,8 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.source_depth_dir = source_depth_dir
+
 
         try:
             self.data_device = torch.device(data_device)
@@ -87,6 +90,14 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        depth_path = os.path.join(self.source_depth_dir, self.image_name.replace(".png", ".npy").replace(".jpg", ".npy"))
+        if os.path.exists(depth_path):
+            depth = np.load(depth_path)
+            self.depth_mask = torch.tensor(depth > 0.01).float()  # Simple threshold to make binary mask
+            self.depth_mask = self.depth_mask.to("cuda")  # Move to CUDA for training
+        else:
+            self.depth_mask = None
         
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

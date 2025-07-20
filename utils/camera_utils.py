@@ -14,6 +14,7 @@ import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
+import os
 
 WARNED = False
 
@@ -60,11 +61,29 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+    camera = Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+                FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
+                image=image, invdepthmap=invdepthmap,
+                image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,  source_depth_dir=args.source_depth_dir)
+
+    # Add .npy-based depth map loading here
+    if hasattr(args, "source_depth_dir") and args.source_depth_dir:
+        import torch
+        image_name_no_ext = os.path.splitext(camera.image_name)[0]
+        depth_path = os.path.join(args.source_depth_dir, image_name_no_ext + ".npy")
+
+        if os.path.exists(depth_path):
+            depth_np = np.load(depth_path)
+            depth_tensor = torch.from_numpy(depth_np).float().to(args.data_device)
+            depth_mask = (depth_tensor > 0).float()
+            camera.depth_map = depth_tensor
+            camera.depth_mask = depth_mask
+        else:
+            print(f"[WARNING] No .npy depth found for {camera.image_name}")
+
+    return camera
+
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []
